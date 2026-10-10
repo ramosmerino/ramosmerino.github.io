@@ -1,7 +1,4 @@
 ---
-import { Image } from "astro:assets";
-import logo from "../assets/logo.svg";
-
 const navItems: Array<{ name: string; href: string }> = [];
 
 // Get current path for active link highlighting
@@ -11,15 +8,6 @@ const currentPath = Astro.url.pathname;
 <nav class="fixed top-0 left-0 right-0 z-50">
   <div class="container mx-auto px-4 sm:px-6 lg:px-8">
     <div class="flex items-center justify-between h-16">
-      <!-- Logo -->
-      <a 
-        href="/" 
-        class="flex items-center space-x-2 text-xl font-bold text-primary hover:text-primary-hover transition-colors"
-        aria-label="Inicio"
-      >
-        <Image src={logo} alt="CRM" class="w-24 h-24" />
-      </a>
-
       <!-- Desktop Navigation -->
       <div class="hidden md:flex items-center space-x-1">
         {navItems.map((item) => (

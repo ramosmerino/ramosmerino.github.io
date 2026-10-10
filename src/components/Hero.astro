@@ -34,11 +34,13 @@
   }
 
   .contact {
-    background-color: var(--color-black);
-    color: var(--color-white);
+    background: none;
+    color: var(--color-text);
     font-family: inherit;
     font-weight: 500;
-    text-transform: lowercase;
+    font-variant-ligatures: common-ligatures discretionary-ligatures
+      historical-ligatures contextual;
+    text-transform: uppercase;
     font-size: 0.875rem;
     text-decoration: none;
     border: none;
@@ -66,6 +68,8 @@
   }
 
   canvas {
+    /* sin esto el navegador toma el arrastre como scroll y cancela pointermove */
+    touch-action: none;
     image-rendering: pixelated;
     background-color: var(--color-bg);
     opacity: 0.4;
@@ -133,6 +137,172 @@
     }
   }
 
+  // Audio: 5 osciladores en Fa lidio (F G A B C D E).
+  // - 4 forman acordes de séptima (fundamental, 3ª, 5ª, 7ª sobre la escala).
+  //   La pantalla se divide en 7 columnas invisibles, una por grado: la más
+  //   aguda a la izquierda y la más grave a la derecha. Suena la columna con
+  //   más celdas nacidas/sembradas en cada frame.
+  // - 1 sigue al mouse según su posición y las celdas que siembra al moverse.
+  // La altura (y) controla un filtro paso bajo: arriba pasa todo, abajo solo
+  // graves.
+  const lydian = [0, 2, 4, 6, 7, 9, 11]; // semitonos desde la tónica
+  const rootFreq = 174.61; // F3
+  const soundColumns = 7;
+  const chordInterval = 0.18; // segundos mínimos entre acordes
+  const minCutoff = 150;
+  const maxCutoff = 9000;
+
+  let audioCtx: AudioContext | null = null;
+  let master: GainNode | null = null;
+  let chordFilter: BiquadFilterNode | null = null;
+  let chordVoices: { osc: OscillatorNode; gain: GainNode }[] = [];
+  let mouseVoice: { osc: OscillatorNode; gain: GainNode; filter: BiquadFilterNode } | null = null;
+  let lastChordTime = 0;
+
+  const fadeSeconds = 5;
+  const masterLevel = 0.5;
+  let releaseTimer: number | undefined;
+
+  function createVoice(ctx: AudioContext, destination: AudioNode) {
+    const osc = ctx.createOscillator();
+    osc.type = "sawtooth";
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    osc.connect(gain);
+    gain.connect(destination);
+    osc.start();
+    return { osc, gain };
+  }
+
+  // Cada clic (re)inicia el sonido: volumen pleno y fade out lento de 5 s
+  function enableAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AC) return;
+      audioCtx = new AC();
+      const compressor = audioCtx.createDynamicsCompressor();
+      master = audioCtx.createGain();
+      master.connect(compressor);
+      compressor.connect(audioCtx.destination);
+
+      chordFilter = audioCtx.createBiquadFilter();
+      chordFilter.type = "lowpass";
+      chordFilter.connect(master);
+      chordVoices = [0, 1, 2, 3].map(() => createVoice(audioCtx!, chordFilter!));
+
+      const mouseFilter = audioCtx.createBiquadFilter();
+      mouseFilter.type = "lowpass";
+      mouseFilter.connect(master);
+      mouseVoice = { ...createVoice(audioCtx, mouseFilter), filter: mouseFilter };
+      lastChordTime = 0;
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume();
+
+    const t = audioCtx.currentTime;
+    master!.gain.cancelScheduledValues(t);
+    master!.gain.setValueAtTime(masterLevel, t);
+    master!.gain.exponentialRampToValueAtTime(0.0001, t + fadeSeconds);
+
+    clearTimeout(releaseTimer);
+    releaseTimer = window.setTimeout(releaseAudio, fadeSeconds * 1000 + 100);
+  }
+
+  // Al terminar el fade se detienen los 5 osciladores y se cierra el contexto
+  function releaseAudio() {
+    [...chordVoices, ...(mouseVoice ? [mouseVoice] : [])].forEach(({ osc, gain }) => {
+      try {
+        osc.stop();
+      } catch {}
+      osc.disconnect();
+      gain.disconnect();
+    });
+    chordVoices = [];
+    mouseVoice = null;
+    chordFilter = null;
+    audioCtx?.close();
+    audioCtx = null;
+    master = null;
+  }
+
+  // Frecuencia del grado `index` de la escala (puede pasar de 6: sube de octava)
+  function scaleFreq(index: number) {
+    const semitones = lydian[index % lydian.length] + 12 * Math.floor(index / lydian.length);
+    return rootFreq * Math.pow(2, semitones / 12);
+  }
+
+  // Columna de pantalla -> grado: izquierda = más agudo (E), derecha = más grave (F)
+  function degreeForX(x: number) {
+    const column = Math.min(soundColumns - 1, Math.floor((x / cols) * soundColumns));
+    return soundColumns - 1 - column;
+  }
+
+  function cutoffForY(y: number) {
+    const height = 1 - y / (rows - 1 || 1); // 1 arriba, 0 abajo
+    return minCutoff * Math.pow(maxCutoff / minCutoff, height);
+  }
+
+  // Envolvente: ataque rápido y decaimiento suave
+  function pluck(gain: GainNode, t: number, level: number, decay: number) {
+    gain.gain.cancelScheduledValues(t);
+    gain.gain.setTargetAtTime(level, t, 0.01);
+    gain.gain.setTargetAtTime(0, t + 0.08, decay);
+  }
+
+  function playChord(degree: number, avgY: number, count: number) {
+    if (!audioCtx || !chordFilter || audioCtx.state !== "running") return;
+    const t = audioCtx.currentTime;
+    if (t - lastChordTime < chordInterval) return;
+    lastChordTime = t;
+
+    chordFilter.frequency.setTargetAtTime(cutoffForY(avgY), t, 0.02);
+    const level = 0.04 + 0.03 * Math.min(1, count / 40);
+    // Séptima: grados d, d+2, d+4, d+6 de la escala
+    chordVoices.forEach(({ osc, gain }, i) => {
+      osc.frequency.setTargetAtTime(scaleFreq(degree + 2 * i), t, 0.01);
+      pluck(gain, t, level, 0.18);
+    });
+  }
+
+  // Voz del mouse: tono por posición x (una octava sobre los acordes), filtro
+  // por y, y volumen según cuántas celdas sembró el movimiento
+  function playMouse(x: number, y: number, seeded: number) {
+    if (!audioCtx || !mouseVoice || audioCtx.state !== "running") return;
+    const t = audioCtx.currentTime;
+    mouseVoice.osc.frequency.setTargetAtTime(scaleFreq(degreeForX(x) + lydian.length), t, 0.01);
+    mouseVoice.filter.frequency.setTargetAtTime(cutoffForY(y), t, 0.02);
+    pluck(mouseVoice.gain, t, 0.03 + 0.03 * (seeded / 3), 0.12);
+  }
+
+  // Actividad por frame (nacimientos + celdas sembradas) agrupada por columna
+  const columnCount = new Array(soundColumns).fill(0);
+  const columnYSum = new Array(soundColumns).fill(0);
+
+  function queueSound(x: number, y: number) {
+    const c = Math.min(soundColumns - 1, Math.floor((x / cols) * soundColumns));
+    columnCount[c]++;
+    columnYSum[c] += y;
+  }
+
+  function flushSounds() {
+    let best = 0;
+    for (let c = 1; c < soundColumns; c++) if (columnCount[c] > columnCount[best]) best = c;
+    if (columnCount[best] > 0) {
+      const mid = ((best + 0.5) / soundColumns) * cols;
+      playChord(degreeForX(mid), columnYSum[best] / columnCount[best], columnCount[best]);
+    }
+    columnCount.fill(0);
+    columnYSum.fill(0);
+  }
+
+  // Siembra una celda muerta; devuelve true si la sembró. Si no es silenciosa,
+  // aporta al acorde del frame
+  function seedCell(x: number, y: number, silent = false) {
+    if (x < 0 || x >= cols || y < 0 || y >= rows || grid[x][y] === 1) return false;
+    grid[x][y] = 1;
+    if (!silent) queueSound(x, y);
+    return true;
+  }
+
   function update() {
     next = grid.map((arr: any) => [...arr]);
     willDie = grid.map((arr: any) => arr.map(() => false));
@@ -154,7 +324,10 @@
         if (cell === 1 && (neighbors < 2 || neighbors > 3)) {
           next[x][y] = 0;
           willDie[x][y] = true;
-        } else if (cell === 0 && neighbors === 3) next[x][y] = 1;
+        } else if (cell === 0 && neighbors === 3) {
+          next[x][y] = 1;
+          queueSound(x, y);
+        }
       }
     }
   }
@@ -183,7 +356,7 @@
       for (let x = x0; x <= x1; x++) {
         for (let y = 0; y < rows; y++) {
           const dist = Math.hypot(x - cx, y - cy);
-          if (Math.abs(dist - radius) < 1.5 && Math.random() < density) grid[x][y] = 1;
+          if (Math.abs(dist - radius) < 1.5 && Math.random() < density) seedCell(x, y);
         }
       }
     });
@@ -250,6 +423,7 @@
     applyMotion();
     stepRipple();
     update();
+    flushSounds();
     draw();
     grid = next;
     setTimeout(() => {
@@ -269,10 +443,12 @@
       if(grid[cellX][cellY] === 1) {
         grid[cellX][cellY] = 0;
       }
-      else { 
-        grid[cellX][cellY] = 1;
-        grid[cellX][cellY+1] = 1;
-        grid[cellX][cellY-1] = 1;
+      else {
+        // Las celdas del mouse suenan por la voz propia del mouse, no por los acordes
+        const seeded = [cellY, cellY + 1, cellY - 1].filter((y) =>
+          seedCell(cellX, y, true)
+        ).length;
+        if (seeded > 0) playMouse(cellX, cellY, seeded);
       }
     }
   }
@@ -287,7 +463,9 @@
     for (let x = 0; x < cols; x++) {
       for (let y = 0; y < rows; y++) {
         if(grid[x][y] === 1) {
-          next[x][y+sign] = delta > 0 ? 1 : 0;
+          const ty = y + sign;
+          if (delta > 0 && ty >= 0 && ty < rows && next[x][ty] === 0) queueSound(x, ty);
+          next[x][ty] = delta > 0 ? 1 : 0;
         }
       }
     }
@@ -297,6 +475,7 @@
 
   function handleClick(event: { clientX: number; clientY: number }) {
     enableMotion();
+    enableAudio();
     const rect = canvas.getBoundingClientRect();
     const mouseX = event.clientX - rect.left;
     const mouseY = event.clientY - rect.top;
@@ -304,14 +483,15 @@
     const cellX = Math.floor(mouseX / resolution);
     const cellY = Math.floor(mouseY / resolution);
 
-    for(let i = 0; i < grid[cellX].length; i++) {
-      grid[cellX][i] = 1;
-      grid[cellX][Math.min(i+1, grid.length)] = 1;
-      grid[cellX][Math.min(i+2,  grid.length)] = 1;
+    // El clic activa el audio pero sus celdas sembradas no suenan
+    for (let i = 0; i < rows; i++) {
+      seedCell(cellX, i, true);
+      seedCell(cellX, i + 1, true);
+      seedCell(cellX, i + 2, true);
     }
-    for (let i = 0; i < grid.length; i++) {
-      grid[i][cellY] = 1;
-      grid[Math.min(i+2, grid[cellX].length)][cellY] = 1;
+    for (let i = 0; i < cols; i++) {
+      seedCell(i, cellY, true);
+      seedCell(i + 2, cellY, true);
     }
   }
 
@@ -352,7 +532,12 @@
     init();
     startRipple();
   });
-  window.addEventListener("mousemove", handleMouseMove);
+  // pointermove cubre mouse y dedo; arrastrar sobre el canvas hace de hover
+  window.addEventListener("pointermove", handleMouseMove);
   window.addEventListener("click", handleClick);
+  // En móvil el audio se desbloquea con el toque (iOS exige touchend; Android
+  // acepta touchstart), así el primer arrastre ya puede sonar
+  window.addEventListener("touchstart", enableAudio, { passive: true });
+  window.addEventListener("touchend", enableAudio);
   window.addEventListener("scroll", handleScroll);
 </script>
