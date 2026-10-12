@@ -118,12 +118,16 @@
     ctx.fillRect(x, y, size, size);
   }
 
+  let aliveCount = 0;
+
   function draw() {
+    aliveCount = 0;
     ctx.clearRect(0, 0, width, height);
     ctx.globalAlpha = 1;
     for (let x = 0; x < cols; x++) {
       for (let y = 0; y < rows; y++) {
         if (grid[x][y] === 1) {
+          aliveCount++;
           // Las celdas a punto de morir brillan más que el resto
           ctx.globalAlpha = willDie[x][y] ? 1 : dimAlpha;
           ctx.fillStyle = fg;
@@ -137,12 +141,14 @@
     }
   }
 
-  // Audio: 5 osciladores en Fa lidio (F G A B C D E).
+  // Audio: 6 osciladores en Fa lidio (F G A B C D E).
   // - 4 forman acordes de séptima (fundamental, 3ª, 5ª, 7ª sobre la escala).
   //   La pantalla se divide en 7 columnas invisibles, una por grado: la más
   //   aguda a la izquierda y la más grave a la derecha. Suena la columna con
   //   más celdas nacidas/sembradas en cada frame.
   // - 1 sigue al mouse según su posición y las celdas que siembra al moverse.
+  // - 1 hace destellos agudos y breves ("estrellas", "perlas") que titilan en
+  //   proporción a las celdas vivas y toman su nota de una celda viva al azar.
   // La altura (y) controla un filtro paso bajo: arriba pasa todo, abajo solo
   // graves.
   const lydian = [0, 2, 4, 6, 7, 9, 11]; // semitonos desde la tónica
@@ -151,12 +157,20 @@
   const chordInterval = 0.18; // segundos mínimos entre acordes
   const minCutoff = 150;
   const maxCutoff = 9000;
+  const sparkleOctaves = 3; // octavas sobre la fundamental (F6–E7)
+  const sparkleStep = 0.05; // segundos entre destellos
+  const sparkleLength = 0.045;
+  const sparkleLevel = 0.025;
+  const sparkleDensityGain = 20; // celdas vivas -> destellos por frame
+  const sparkleMaxPerFrame = 3;
 
   let audioCtx: AudioContext | null = null;
   let master: GainNode | null = null;
   let chordFilter: BiquadFilterNode | null = null;
   let chordVoices: { osc: OscillatorNode; gain: GainNode }[] = [];
   let mouseVoice: { osc: OscillatorNode; gain: GainNode; filter: BiquadFilterNode } | null = null;
+  let sparkleVoice: { osc: OscillatorNode; gain: GainNode } | null = null;
+  let sparkleNext = 0; // instante en que puede sonar el próximo destello
   let lastChordTime = 0;
 
   const fadeSeconds = 5;
@@ -194,6 +208,9 @@
       mouseFilter.type = "lowpass";
       mouseFilter.connect(master);
       mouseVoice = { ...createVoice(audioCtx, mouseFilter), filter: mouseFilter };
+      sparkleVoice = createVoice(audioCtx, master);
+      sparkleVoice.osc.type = "sine";
+      sparkleNext = 0;
       lastChordTime = 0;
     }
     if (audioCtx.state === "suspended") audioCtx.resume();
@@ -209,7 +226,11 @@
 
   // Al terminar el fade se detienen los 5 osciladores y se cierra el contexto
   function releaseAudio() {
-    [...chordVoices, ...(mouseVoice ? [mouseVoice] : [])].forEach(({ osc, gain }) => {
+    [
+      ...chordVoices,
+      ...(mouseVoice ? [mouseVoice] : []),
+      ...(sparkleVoice ? [sparkleVoice] : []),
+    ].forEach(({ osc, gain }) => {
       try {
         osc.stop();
       } catch {}
@@ -218,6 +239,7 @@
     });
     chordVoices = [];
     mouseVoice = null;
+    sparkleVoice = null;
     chordFilter = null;
     audioCtx?.close();
     audioCtx = null;
@@ -263,14 +285,51 @@
     });
   }
 
-  // Voz del mouse: tono por posición x (una octava sobre los acordes), filtro
-  // por y, y volumen según cuántas celdas sembró el movimiento
-  function playMouse(x: number, y: number, seeded: number) {
+  // Voz del mouse: el tono sube con la altura del cursor, cuantizado a la
+  // escala y repartido en 3 octavas (F4 abajo, F7 arriba); el mismo y abre el
+  // filtro, y el volumen depende de cuántas celdas sembró el movimiento
+  const mouseBaseDegree = lydian.length; // F4
+  const mouseOctaves = 3;
+  function playMouse(y: number, seeded: number) {
     if (!audioCtx || !mouseVoice || audioCtx.state !== "running") return;
     const t = audioCtx.currentTime;
-    mouseVoice.osc.frequency.setTargetAtTime(scaleFreq(degreeForX(x) + lydian.length), t, 0.01);
+    const height = 1 - y / (rows - 1 || 1); // 1 arriba, 0 abajo
+    const degree = mouseBaseDegree + Math.round(height * lydian.length * mouseOctaves);
+    mouseVoice.osc.frequency.setTargetAtTime(scaleFreq(degree), t, 0.01);
     mouseVoice.filter.frequency.setTargetAtTime(cutoffForY(y), t, 0.02);
     pluck(mouseVoice.gain, t, 0.03 + 0.03 * (seeded / 3), 0.12);
+  }
+
+  // Destellos agudos: cuantas más celdas vivas, más titilan. Cada uno toma la
+  // columna (grado) de una celda viva al azar y se agenda en secuencia para que
+  // no se solapen.
+  function playSparkles() {
+    if (!audioCtx || !sparkleVoice || audioCtx.state !== "running") return;
+    const density = aliveCount / (cols * rows);
+    const expected = Math.min(sparkleMaxPerFrame, density * sparkleDensityGain);
+    const n = Math.floor(expected) + (Math.random() < expected % 1 ? 1 : 0);
+    const t = audioCtx.currentTime;
+    const { osc, gain } = sparkleVoice;
+    sparkleNext = Math.max(sparkleNext, t);
+
+    for (let i = 0; i < n && sparkleNext < t + 0.1; i++) {
+      let x = -1;
+      for (let tries = 0; tries < 30 && x < 0; tries++) {
+        const cx = Math.floor(Math.random() * cols);
+        const cy = Math.floor(Math.random() * rows);
+        if (grid[cx][cy] === 1) x = cx;
+      }
+      if (x < 0) return;
+      const ts = sparkleNext;
+      osc.frequency.setValueAtTime(
+        scaleFreq(degreeForX(x) + lydian.length * sparkleOctaves),
+        ts
+      );
+      gain.gain.setValueAtTime(0.0001, ts);
+      gain.gain.linearRampToValueAtTime(sparkleLevel, ts + 0.004);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ts + sparkleLength);
+      sparkleNext += sparkleStep;
+    }
   }
 
   // Actividad por frame (nacimientos + celdas sembradas) agrupada por columna
@@ -425,6 +484,7 @@
     update();
     flushSounds();
     draw();
+    playSparkles();
     grid = next;
     setTimeout(() => {
         loop();
@@ -448,7 +508,7 @@
         const seeded = [cellY, cellY + 1, cellY - 1].filter((y) =>
           seedCell(cellX, y, true)
         ).length;
-        if (seeded > 0) playMouse(cellX, cellY, seeded);
+        if (seeded > 0) playMouse(cellY, seeded);
       }
     }
   }
